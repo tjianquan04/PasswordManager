@@ -331,6 +331,10 @@ export default function App() {
   
   // Password manager states
   const [passwords, setPasswords] = useState<{id: string, service: string, username: string, encryptedData: string}[]>([]);
+  
+  // Decrypt demo states
+  const [isDecrypting, setIsDecrypting] = useState(false);
+  const [decryptedContent, setDecryptedContent] = useState<string | null>(null);
   const [newService, setNewService] = useState('');
   const [newUsername, setNewUsername] = useState('');
   const [newPassword, setNewPassword] = useState('');
@@ -416,21 +420,59 @@ export default function App() {
     if (!account) throw new Error('Wallet not connected');
 
     try {
-      // Try without manual packageId - let SDK handle everything automatically
-      console.log('Attempting Seal encryption with auto-resolved package ID...');
+      console.log('Attempting Seal encryption with auto-detected package ID...');
       
-      // Check if there's a way to create session without explicit packageId
-      // For now, let's try using a standard Sui system package
-      const packageId = '0x7ad0ee086b5ace27193dc896d6b2963bd0957689bbdb4df11947b9de4e32d96e'; // Sui Move stdlib
-
+      // Get the package ID from the allowlisted servers
+      const allowlistedServers = getAllowlistedKeyServers('testnet');
+      if (allowlistedServers.length === 0) {
+        throw new Error('No allowlisted key servers found for testnet');
+      }
+      
+      // Get the first server's object to determine the package ID
+      const firstServerObjectId = allowlistedServers[0];
+      console.log('Using first allowlisted server:', firstServerObjectId);
+      
+      // Query the server object to get package ID
+      const serverObject = await suiClient.getObject({
+        id: firstServerObjectId,
+        options: { showContent: true }
+      });
+      
+      if (!serverObject.data?.content || serverObject.data.content.dataType !== 'moveObject') {
+        throw new Error('Failed to get server object content');
+      }
+      
+      // Extract package ID from the server object
+      const packageId = serverObject.data.content.type.split('::')[0];
+      console.log('Auto-detected Seal package ID:', packageId);
+      
+      // Create session key - this should automatically prompt for wallet signing
+      console.log('Creating session key - this will prompt wallet signing...');
+      console.log('⚠️ Please approve the signing request in your wallet when prompted!');
+      
+      // The SessionKey.create should automatically handle the wallet signing process
+      // If it doesn't prompt for signing, it means the wallet integration isn't working properly
       const sessionKey = await SessionKey.create({
         address: account.address,
         packageId,
         ttlMin: 30, // Maximum allowed TTL is 30 minutes
         suiClient,
+        // The Seal SDK should automatically detect and use the wallet for signing
       });
-
-      // Use the pre-initialized sealClient instead of creating a new one
+      
+      console.log('Session key created - checking if properly signed...');
+      
+      // Verify the session key is properly signed
+      const sessionKeyData = sessionKey.export();
+      console.log('Session key signature status:', {
+        hasSignature: !!sessionKeyData.personalMessageSignature,
+        signatureLength: sessionKeyData.personalMessageSignature?.length || 0
+      });
+      
+      if (!sessionKeyData.personalMessageSignature) {
+        throw new Error('Session key was not properly signed by wallet. Please ensure you approve the signing request.');
+      }
+      
       // Generate a proper hex ID (convert timestamp to hex)
       const hexId = Date.now().toString(16).padStart(16, '0'); // Convert to hex and pad to 16 chars
       
@@ -448,13 +490,13 @@ export default function App() {
       setCurrentEncryptedData(encryptedObject);
       
       // Export session key and ensure it's serializable
-      let sessionKeyData;
+      let exportedSessionKeyData;
       try {
         const rawSessionKeyData = sessionKey.export();
         console.log('Raw session key data:', rawSessionKeyData);
         
         // Extract the serializable parts manually to avoid toJSON function issues
-        sessionKeyData = {
+        exportedSessionKeyData = {
           address: rawSessionKeyData.address,
           packageId: rawSessionKeyData.packageId,
           mvrName: rawSessionKeyData.mvrName,
@@ -465,13 +507,13 @@ export default function App() {
         };
         
         // Test serialization
-        JSON.stringify(sessionKeyData);
+        JSON.stringify(exportedSessionKeyData);
         console.log('Session key data successfully extracted and serializable');
       } catch (serializationError) {
         console.warn('Session key extraction failed:', serializationError);
         // Create a serializable version with only essential data
-        sessionKeyData = {
-          address: account.address,
+        exportedSessionKeyData = {
+          address: account?.address || '',
           packageId,
           creationTime: Date.now(),
           hexId,
@@ -481,7 +523,7 @@ export default function App() {
       
       return { 
         encryptedData: encryptedObject, 
-        sessionKeyData
+        sessionKeyData: exportedSessionKeyData
       };
     } catch (error: any) {
       console.error('Seal encryption failed:', error.message, error);
@@ -514,6 +556,19 @@ export default function App() {
       if (currentSessionKey && currentEncryptedData && 
           currentEncryptedData.every((byte, index) => byte === encryptedData[index])) {
         console.log('Using temporary session key for immediate decryption');
+        
+        // Debug the session key before using it
+        const tempSessionKeyData = currentSessionKey.export();
+        console.log('Temporary session key debug:', {
+          hasSignature: !!tempSessionKeyData.personalMessageSignature,
+          signatureLength: tempSessionKeyData.personalMessageSignature?.length || 0,
+          address: tempSessionKeyData.address,
+          packageId: tempSessionKeyData.packageId
+        });
+        
+        if (!tempSessionKeyData.personalMessageSignature) {
+          throw new Error('Temporary session key missing signature - cannot decrypt');
+        }
         
         // Create a transaction for decryption
         const tx = new Transaction();
@@ -821,8 +876,13 @@ export default function App() {
         throw new Error('❌ Invalid blob ID format!\n\nYou entered a transaction hash (starts with 0x).\nPlease use the BLOB ID that was displayed after upload.\n\nBlob IDs start with letters like:\n• bafkreigh...\n• cuOPBq...\n• bagaaiera...');
       }
       
-      if (blobId.length < 10 || !/^[a-zA-Z]/.test(blobId)) {
-        throw new Error('❌ Invalid blob ID format!\n\nBlob IDs should:\n• Start with letters (not numbers or symbols)\n• Be longer than 10 characters\n• Look like: bafkreigh2akisc... or cuOPBqTLMPK7...');
+      if (blobId.length < 10) {
+        throw new Error('❌ Invalid blob ID format!\n\nBlob ID is too short. Valid blob IDs are typically 40+ characters long.');
+      }
+      
+      // Allow blob IDs that start with letters, numbers, or common base64url characters
+      if (!/^[a-zA-Z0-9_-]/.test(blobId)) {
+        throw new Error('❌ Invalid blob ID format!\n\nBlob IDs should start with alphanumeric characters.\nExample: MXoxozt-iZ04D2GE3JX9_PROAIqtituLetpGkE9JRkY');
       }
       
       console.log('Retrieving blob:', blobId);
@@ -874,6 +934,49 @@ export default function App() {
       setError(`Failed to retrieve blob: ${e?.message || String(e)}`);
     } finally {
       setBusy(false);
+    }
+  }
+
+  // Real decrypt function using Seal
+  async function realDecrypt() {
+    if (!account) {
+      setError('Please connect your wallet first');
+      return;
+    }
+
+    if (!currentSessionKey || !currentEncryptedData) {
+      setError('No encrypted data available. Please upload encrypted content first.');
+      return;
+    }
+
+    setIsDecrypting(true);
+    setDecryptedContent(null);
+    setError(null);
+    
+    try {
+      console.log('Starting real Seal decryption...');
+      
+      // Create a transaction for decryption
+      const tx = new Transaction();
+      tx.setSender(account.address);
+      const txBytes = await tx.build({ client: suiClient });
+      
+      // Decrypt the data using the stored session key
+      const decryptedBytes = await sealClient.decrypt({
+        data: currentEncryptedData,
+        sessionKey: currentSessionKey,
+        txBytes,
+      });
+      
+      const decryptedText = new TextDecoder().decode(decryptedBytes);
+      setDecryptedContent(decryptedText);
+      console.log('Real Seal decryption successful!');
+      
+    } catch (e: any) {
+      console.error('Real decryption error:', e);
+      setError(`Decryption failed: ${e?.message || String(e)}`);
+    } finally {
+      setIsDecrypting(false);
     }
   }
 
@@ -1103,7 +1206,7 @@ export default function App() {
             <div>
               <strong>Upload Successful!</strong>
               <div style={{ marginTop: '0.5rem', fontSize: '0.875rem' }}>
-                <div style={{ marginBottom: '0.5rem' }}>Blob ID: <code style={styles.codeBlock}>{blobId}</code></div>
+                <div style={{ marginBottom: '0.5rem' }}>Blob ID: <code style={{ fontFamily: 'Monaco, Consolas, "Lucida Console", monospace', fontSize: '0.875rem', wordBreak: 'break-all' }}>{blobId}</code></div>
                 <button 
                   onClick={() => setRetrieveBlobId(blobId)}
                   style={{
@@ -1286,6 +1389,75 @@ export default function App() {
                   <div>• File Size: {rawData?.length.toLocaleString()} bytes</div>
                 </div>
               </details>
+            </div>
+          )}
+        </div>
+
+        {/* Decrypt Demo Section */}
+        <div style={styles.card} className="hover-effect card">
+          <h2 style={styles.cardTitle}>
+            🔓 Decrypt Content
+          </h2>
+          <p style={{ color: colors.gray600, marginBottom: '1.5rem' }}>
+            Decrypt the encrypted content using Seal threshold cryptography. Only available after uploading encrypted content.
+          </p>
+          
+          {/* Status indicator */}
+          <div style={{ marginBottom: '1rem' }}>
+            <div style={{ 
+              ...styles.badge,
+              ...(currentSessionKey && currentEncryptedData ? styles.badgeSuccess : styles.badgeGray)
+            }}>
+              {currentSessionKey && currentEncryptedData ? '🔐 Encrypted data ready' : '❌ No encrypted data available'}
+            </div>
+          </div>
+          
+          <div style={styles.flexRow}>
+            <button 
+              onClick={() => void realDecrypt()} 
+              disabled={isDecrypting || !currentSessionKey || !currentEncryptedData}
+              style={{
+                ...styles.button,
+                ...styles.buttonPrimary,
+                ...(isDecrypting || !currentSessionKey || !currentEncryptedData ? styles.buttonDisabled : {}),
+              }}
+              className={!isDecrypting && currentSessionKey && currentEncryptedData ? "button-hover" : ""}
+            >
+              {isDecrypting ? (
+                <>
+                  <div style={styles.spinner}></div>
+                  Decrypting...
+                </>
+              ) : (
+                <>
+                  🔓 Decrypt Content
+                </>
+              )}
+            </button>
+          </div>
+          
+          {/* Decrypted Content Display */}
+          {decryptedContent && (
+            <div style={{ marginTop: '1.5rem', padding: '1.5rem', backgroundColor: colors.success + '10', borderRadius: '0.75rem', border: `1px solid ${colors.success}` }}>
+              <h3 style={{ ...styles.cardTitle, marginBottom: '1rem', fontSize: '1.125rem', color: colors.success }}>
+                ✅ Decrypted Successfully!
+              </h3>
+              
+              <div style={{ 
+                ...styles.codeBlock, 
+                backgroundColor: colors.white,
+                color: colors.gray800,
+                border: `1px solid ${colors.gray200}`,
+                maxHeight: '200px'
+              }}>
+                <pre style={{ margin: 0, whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
+                  {decryptedContent}
+                </pre>
+              </div>
+              
+              <div style={{ marginTop: '1rem', fontSize: '0.875rem', color: colors.success }}>
+                🎉 Content decrypted and ready to use!
+              </div>
             </div>
           )}
         </div>
