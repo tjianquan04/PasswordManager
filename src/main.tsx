@@ -5,7 +5,7 @@ import { SuiClientProvider, WalletProvider, createNetworkConfig } from '@mysten/
 import { getFullnodeUrl } from '@mysten/sui/client';
 // Required styles for @mysten/dapp-kit components (ConnectButton / ConnectModal)
 import '@mysten/dapp-kit/dist/index.css';
-import App from './web/App';
+import Router from './web/Router';
 
 const queryClient = new QueryClient();
 
@@ -19,7 +19,7 @@ root.render(
     <QueryClientProvider client={queryClient}>
       <SuiClientProvider networks={networkConfig} defaultNetwork="testnet">
         <WalletProvider autoConnect>{/* Wallet adapters inside package */}
-          <App />
+          <Router />
         </WalletProvider>
       </SuiClientProvider>
     </QueryClientProvider>
